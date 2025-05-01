@@ -17,14 +17,14 @@ const SECRET_KEY = process.env.SECRET_KEY || 'update-this-secret';
  * - Adds an expiration time (UNIX timestamp, 10 minutes from now)
  * - Returns a local endpoint: /segment/resource?resourceId=xxx&sig=yyy&exp=zzz
  */
-function generateSignedUrl(resourceId: string, type: 'segment'): string {
+function generateSignedUrl(resourceId: string, type: 'segment' | 'key'): string {
   const exp = Math.floor(Date.now() / 1000) + 600; // 600 seconds = 10 minutes
   const signature = crypto
     .createHmac('sha256', SECRET_KEY)
     .update(`${resourceId}${exp}${type}`)
     .digest('hex');
 
-  return `/fetch/segment/resource?resourceId=${resourceId}&sig=${signature}&exp=${exp}`;
+  return `/fetch/${type}/resource?resourceId=${resourceId}&sig=${signature}&exp=${exp}`;
 }
 
 /**
@@ -36,7 +36,7 @@ function verifySignedUrl(
   resourceId: string,
   sig: string,
   exp: string,
-  type: 'segment'
+  type: 'segment' | 'key'
 ): boolean {
   const now = Math.floor(Date.now() / 1000);
   if (parseInt(exp, 10) < now) {
@@ -87,13 +87,27 @@ router.get('/', async (req: Request, res: Response) => {
     const transformed = lines.map((line) => {
       const trimmed = line.trim();
       if (!trimmed || trimmed.startsWith('#')) {
+        // Handle #EXT-X-KEY tags
+        if (trimmed.startsWith('#EXT-X-KEY')) {
+          const keyUriMatch = trimmed.match(/URI="(.*?)"/);
+          if (keyUriMatch) {
+            const keyUri = keyUriMatch[1];
+            const resourceId = uuidv4();
+
+            const absoluteKeyUrl = new URL(keyUri, url).href;
+            cache.set(resourceId, absoluteKeyUrl);
+
+            const signedKeyUrl = generateSignedUrl(resourceId, 'key');
+            debug(`Rewriting key URI: "${keyUri}" -> "${signedKeyUrl}"`);
+
+            return trimmed.replace(keyUri, signedKeyUrl);
+          }
+        }
         return line;
       }
 
       const resourceId = uuidv4();
-
       const absoluteUrl = new URL(trimmed, url).href;
-
       cache.set(resourceId, absoluteUrl);
 
       const signedUrl = generateSignedUrl(resourceId, 'segment');
@@ -149,6 +163,42 @@ router.get('/segment/resource', async (req: Request, res: Response) => {
   } catch (error) {
     debug(`Failed to fetch resource: ${(error as Error).message}`);
     res.status(500).json({ error: 'Error fetching segment content' });
+  }
+});
+
+// Add a new route to handle key requests
+router.get('/key/resource', async (req: Request, res: Response) => {
+  const { resourceId, sig, exp } = req.query;
+
+  if (!resourceId || !sig || !exp) {
+    return res.status(400).json({ error: 'Missing signed URL params' });
+  }
+
+  if (!verifySignedUrl(resourceId as string, sig as string, exp as string, 'key')) {
+    return res.status(400).json({ error: 'Invalid or expired signed URL' });
+  }
+
+  const realKeyUrl = cache.get<string>(resourceId as string);
+  if (!realKeyUrl) {
+    return res.status(404).json({ error: 'Key not found or expired' });
+  }
+
+  try {
+    debug(`Fetching encryption key from: ${realKeyUrl}`);
+
+    const keyResp = await axios.get(realKeyUrl, { responseType: 'arraybuffer' });
+
+    let contentType = keyResp.headers['content-type'];
+    if (!contentType) {
+      contentType = 'application/octet-stream';
+    }
+
+    res.setHeader('Content-Type', contentType);
+    res.send(keyResp.data);
+    debug('Encryption key served successfully');
+  } catch (error) {
+    debug(`Failed to fetch encryption key: ${(error as Error).message}`);
+    res.status(500).json({ error: 'Error fetching encryption key' });
   }
 });
 
